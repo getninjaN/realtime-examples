@@ -10,105 +10,121 @@
 import websockets
 import asyncio
 import argparse
+import os
+import json
+import atexit
+import random
+import string
 from concurrent.futures.thread import ThreadPoolExecutor
 
+def id_generator(size=6, chars=string.ascii_uppercase + string.digits):
+  return "".join(random.choice(chars) for _ in range(size))
 
-async def writer(
-    args: argparse.Namespace, websocket: websockets.WebSocketClientProtocol
-) -> None:
-    """Reads data from input file, and writes it to websocket.
+file = open("./output/" + id_generator() + ".json", "w")
 
-    This function used a threadpool in order to async read the data in blocks of 32000 bytes. 
-    As the read function is blocking we need to run it in a thread."""
+async def writer(args: argparse.Namespace, websocket: websockets.WebSocketClientProtocol) -> None:
+  """Reads data from input file, and writes it to websocket.
 
-    loop = asyncio.get_event_loop()
-    threadpool = ThreadPoolExecutor(1)
+  This function used a threadpool in order to async read the data in blocks of 32000 bytes. 
+  As the read function is blocking we need to run it in a thread."""
 
-    fp = open(args.input_stream, "rb")
-    while True:
-        data = await loop.run_in_executor(threadpool, fp.read, 32768)
-        if not data:
-            print("EOF")
-            break
-        await websocket.send(data)
-        await asyncio.sleep(0.25)
+  loop = asyncio.get_event_loop()
+  threadpool = ThreadPoolExecutor(1)
 
-    # Notify we are done
-    await websocket.send('{"action": "stop"}')
+  fp = open(args.input_stream, "rb")
+  while True:
+    data = await loop.run_in_executor(threadpool, fp.read, 32768)
+    if not data:
+      print("EOF")
+      break
+    await websocket.send(data)
+    await asyncio.sleep(0.25)
 
-    threadpool.shutdown()
-    fp.close()
+  # Notify we are done
+  await websocket.send('{"action": "stop"}')
+
+  threadpool.shutdown()
+  fp.close()
 
 
 async def reader(websocket):
-    async for message in websocket:
-        print(message)
+  async for message in websocket:
+    print(message)
 
-        # Stop when stopped
-        if message == '{"state": "stopped"}' or message == '{"state":"stopped"}':
-            print("Stopped")
-            break
+    if isinstance(message, str) and '"result"' in message:
+      print("  " + str(message) + ",", file = file)
+
+    # Stop when stopped
+    if message == '{"state": "stopped"}' or message == '{"state":"stopped"}':
+      print("Stopped")
+      break
 
 
 async def run_connection(args: argparse.Namespace) -> None:
+  # Connect to websocket
+  websocket: websockets.WebSocketClientProtocol = await websockets.connect(
+      f"wss://api.zoommedia.ai/realtime?language={args.language}",
+      extra_headers={"x-zoom-s2t-key": args.token},
+  )
 
-    # Connect to websocket
-    websocket: websockets.WebSocketClientProtocol = await websockets.connect(
-        f"wss://api.zoommedia.ai/realtime?language={args.language}",
-        extra_headers={"x-zoom-s2t-key": args.token},
+  # Initiate action start
+  await websocket.send('{"action": "start"}')
+
+  # Wait for listening event
+  first_message = await websocket.recv()
+
+  if isinstance(first_message, str) and '"listening"' in first_message:
+    print("Server is listening")
+    print(first_message)
+    message_data = json.loads(first_message)
+
+    print(message_data["session_id"] + " will log to file: " + os.path.basename(file.name))
+
+    print("[", file = file)
+
+    # Start async reader and writer
+    task_reader = asyncio.create_task(reader(websocket))
+    task_writer = asyncio.create_task(writer(args, websocket))
+
+    # Wait for all tasks to finish
+    w = await asyncio.wait(
+      [task_writer, task_reader], return_when=asyncio.FIRST_EXCEPTION
     )
 
-    # Initiate action start
-    await websocket.send('{"action": "start"}')
+    if w[0] == task_reader:
+      print("Reader finished")
+      await task_writer
+  else:
+    print("Server not listening")
+    print(first_message)
 
-    # Wait for listening event
-    first_message = await websocket.recv()
-
-    if isinstance(first_message, str) and '"listening"' in first_message:
-        print("Server is listening")
-        print(first_message)
-
-        # Start async reader and writer
-        task_reader = asyncio.create_task(reader(websocket))
-        task_writer = asyncio.create_task(writer(args, websocket))
-
-        # Wait for all tasks to finish
-        w = await asyncio.wait(
-            [task_writer, task_reader], return_when=asyncio.FIRST_EXCEPTION
-        )
-
-        if w[0] == task_reader:
-            print("Reader finished")
-            await task_writer
-    else:
-        print("Server not listening")
-        print(first_message)
-
-    # Close websocket
-    await websocket.close()
+  # Close websocket
+  await websocket.close()
 
 
 def main():
+  parser = argparse.ArgumentParser("Realtime Example Client")
 
-    parser = argparse.ArgumentParser("Realtime Example Client")
+  parser.add_argument("language", help="API Language")
+  parser.add_argument("token", help="API Token")
+  parser.add_argument("input_stream", help="Input stream (default: /dev/stdin)", default="/dev/stdin", nargs="?")
 
-    parser.add_argument("language", help="API Language")
-    parser.add_argument("token", help="API Token")
-    parser.add_argument(
-        "input_stream",
-        help="Input stream (default: /dev/stdin)",
-        default="/dev/stdin",
-        nargs="?",
-    )
+  args = parser.parse_args()
 
-    args = parser.parse_args()
+  # Initiate event loop
+  loop = asyncio.get_event_loop()
 
-    # Initiate event loop
-    loop = asyncio.get_event_loop()
+  # Start loop
+  loop.run_until_complete(run_connection(args))
 
-    # Start loop
-    loop.run_until_complete(run_connection(args))
+def exit_handler():
+  file.seek(0, 2)
+  size = file.tell()
+  file.truncate(size - 2)
+  print("\n]", file = file)
+  file.close()
 
+atexit.register(exit_handler)
 
 if __name__ == "__main__":
-    main()
+  main()

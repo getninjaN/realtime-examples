@@ -8,6 +8,9 @@ black = "*"
 
 [packages]
 websockets = "*"
+json = "*"
+asyncio = "*"
+atexit = "*"
 
 [requires]
 python_version = "3.7"
